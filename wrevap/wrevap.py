@@ -1,21 +1,19 @@
-#--------------------------------
-# Name:         wrevap.py
-# Authors:      Charles Morton and Justin Huntington
-# Modified:     2016-11-02
-# Python:       2.7
-#--------------------------------
-
+# %%
+# Code adopted from https://github.com/WSWUP/WREVAP
+# Revised to work with Python 3+ and pandas.
+# Added deep lake evaporations.
 import argparse
 import calendar
 from collections import defaultdict
-import ConfigParser
+import configparser
 import datetime as dt
 import logging
 import math
 import os
 import sys
-
+import pandas as pd
 import numpy as np
+from typing import Union, Optional
 
 
 class paths():
@@ -28,7 +26,7 @@ class data():
     pass
 
 
-def WREVAP(input_path, data_path):
+def WREVAP(input_path, data_path: Union[os.PathLike, pd.DataFrame], output_dir: Optional[os.PathLike] = None, write_output=True):
     """Operational Estimates of Areal Evapotranspiration and Lake Evaporation
 
     Program WREVAP
@@ -36,25 +34,34 @@ def WREVAP(input_path, data_path):
 
     Args:
         input_path (str): file path to the input parameter file
-        data_path (str): file pat to the CSV data file
+        data_path: (os.PathLike or pd.DataFrame): file path to the CSV data file of a pandas dataframe with columns:
+        TD, T, S with the index as the pd.DatetimeIndex in daily. Cannot have missing data.
+        output_dir (Optional, str): Custom path to the output directory. If not specified, output files are written 
+        to the same directory as .ini file (if exists), otherwise the same directory as the data file.
+        write_output (Optional, bool): If True, write output files to disk. Default is True.
     """
     logging.info('WREVAP - Python')
     logging.info('  Input file: {}'.format(input_path))
     logging.info('  Data file:  {}'.format(data_path))
 
-    # Initialize file paths
-    set_input_paths(input_path, data_path)
-    # logging.info('  INI Filename:  {}'.format(paths.ini))
-    # logging.info('  Data Filename: {}'.format(paths.csv))
+    # check if data is a pandas dataframe
+    if isinstance(data_path, pd.DataFrame):
+        set_input_paths(input_path, data_path=None, output_dir=output_dir)
+    else:
+        set_input_paths(input_path, data_path=data_path, output_dir=output_dir)
 
     # Initialize Parameters
     get_parameters()
 
-    # Read in input data
-    read_data_file()
+    # Read data file
+    if isinstance(data_path, pd.DataFrame):
+        read_df(data_path)
+    else:
+        read_data_file()
 
     # CHECK INPUT SPECIFICATIONS AND DO A GENERAL INITIALIZATION
     initialize()
+
 
     # Process data for each time period
     for i, dt_start in enumerate(data.DATE):
@@ -89,7 +96,7 @@ def WREVAP(input_path, data_path):
         if param.LK == 3:
             read_tgw_file()
         if param.LK == 2:
-            for i in xrange(12):
+            for i in range(12):
                 data.TGW[i] = data.TGW[i + 12]
 
         # CALCULATE THE AVAILABLE SOLAR & WATER-BORNE HEAT CALLING IT
@@ -98,34 +105,39 @@ def WREVAP(input_path, data_path):
 
         # DO THE FINAL CALCULATION AND LIST THE INPUTS AND THE
         # RESULTS FOR EACH PERIOD.
-        for i in xrange(param.NN):
+        for i in range(param.NN):
             compute_budget_2(i)
 
         # WRITE THE 12 MOST RECENT VALUES OF TGW TO SOL FILE
-        write_sol_file()
+        if write_output:
+            write_sol_file()
 
-    print_output()
+    if write_output:
+        print_output()
 
-    # LIST THE MONTHLY TOTALS AVERAGED OVER 5 YEARS
-    if param.ISUM == 1:
-        print_monthly_averages()
+        # LIST THE MONTHLY TOTALS AVERAGED OVER 5 YEARS
+        if param.ISUM == 1:
+            print_monthly_averages()
 
 
-def set_input_paths(input_path, data_path):
+def set_input_paths(input_path, data_path, output_dir=None):
     """"""
-    # Since input_path isn't required, get workspace and name from data_path
-    input_ws = os.path.dirname(data_path)
-    input_name, input_ext = os.path.splitext(os.path.basename(data_path))
-
-    # Set paths.INI even if inputs are entered manually
+    # Unless output_dir is specified, output files are written to the same directory as .ini file (if exists),
+    # otherwise the same directory as the data file.
     if input_path is None:
+        input_ws = os.path.dirname(data_path)
+        input_name, input_ext = os.path.splitext(os.path.basename(data_path))
         paths.ini = os.path.join(input_ws, input_name + '.ini')
     else:
+        input_ws = os.path.dirname(input_path)
+        input_name, input_ext = os.path.splitext(os.path.basename(input_path))
         paths.ini = input_path
     paths.csv = data_path
-    paths.res = os.path.join(input_ws, input_name + '.RES')
-    paths.tgw = os.path.join(input_ws, input_name + '.TGW')
-    paths.sol = os.path.join(input_ws, input_name + '.SOL')
+    if output_dir is None:
+        output_dir = input_ws
+    paths.res = os.path.join(output_dir, input_name + '.RES')
+    paths.tgw = os.path.join(output_dir, input_name + '.TGW')
+    paths.sol = os.path.join(output_dir, input_name + '.SOL')
 
 
 def get_value_from_range(v_type=float, prompt='Please enter choice: ',
@@ -135,7 +147,7 @@ def get_value_from_range(v_type=float, prompt='Please enter choice: ',
         v_type = float
     while True:
         try:
-            value = v_type(raw_input(prompt))
+            value = v_type(input(prompt))
             if v_min <= value <= v_max:
                 return value
         except ValueError:
@@ -148,7 +160,7 @@ def get_int_from_list(v_list, v_default=None):
     """"""
     while True:
         try:
-            value = int(raw_input('Please enter choice: ') or v_default)
+            value = int(input('Please enter choice: ') or v_default)
             if value in v_list:
                 return value
         except ValueError:
@@ -194,18 +206,19 @@ def get_parameters():
     # Parameters can be read from file or set manually
     if os.path.isfile(paths.ini):
         ini_exist_flag = True
-        logging.info((
-            '\nThe following WREVAP parameter INI file was found: {}' +
-            '\n\nDo you want to enter WREVAP parameters from this INI file ' +
-            '[Y/n]?').format(paths.ini))
-        while True:
-            user_input = raw_input('Please enter choice: ').upper().strip()
-            if user_input in ['Y', '']:
-                ini_read_flag = True
-                break
-            elif user_input in ['N']:
-                ini_read_flag = False
-                break
+        # logging.info((
+        #     '\nThe following WREVAP parameter INI file was found: {}' +
+        #     '\n\nDo you want to enter WREVAP parameters from this INI file ' +
+        #     '[Y/n]?').format(paths.ini))
+        # while True:
+        #     user_input = input('Please enter choice: ').upper().strip()
+        #     if user_input in ['Y', '']:
+        #         ini_read_flag = True
+        #         break
+        #     elif user_input in ['N']:
+        #         ini_read_flag = False
+        #         break
+        ini_read_flag = True
     else:
         logging.info(
             '\nThe WREVAP parameter INI file was not set or found' +
@@ -218,12 +231,12 @@ def get_parameters():
             os.path.basename(paths.ini)))
         # Check that INI file opens and has section entry ([INPUTS])
         # Get list of all parameter keys
-        config = ConfigParser.SafeConfigParser()
+        config = configparser.ConfigParser()
         try:
-            config.readfp(open(paths.ini))
+            config.read_file(open(paths.ini))
             config.has_section('INPUTS')
             config_items = config.items('INPUTS')
-        except ConfigParser.NoSectionError:
+        except configparser.NoSectionError:
             logging.error((
                 '\nERROR: {}\n' +
                 '  The paramter INI file is missing a section line\n' +
@@ -231,7 +244,7 @@ def get_parameters():
                 '  Try removing the INI file and rebuilding it\n').format(
                     paths.ini))
             sys.exit()
-        except ConfigParser.Error:
+        except configparser.Error:
             logging.error((
                 '\nERROR: {}\n' +
                 '  There is an unknown problem with the paramter INI file \n' +
@@ -283,6 +296,7 @@ def get_parameters():
             PPN = 0.0
             DA = read_param('DA', None, float, config)
             SALT = read_param('SALT', None, float, config)
+            WD = read_param('WD', None, float, config)
             if not DA or DA <= 0:
                 logging.error(
                     '\nERROR: DA paramter must be > 0 when LK > 0')
@@ -306,7 +320,7 @@ def get_parameters():
         dash_line = '-' * 60
         # dash_line = '  ' + '-' * 60
         logging.info('')
-        SITE = raw_input('Enter a site name: ').upper().strip()
+        SITE = input('Enter a site name: ').upper().strip()
 
         # LK
         logging.info((
@@ -394,6 +408,7 @@ def get_parameters():
                 float,
                 'ENTER TOTAL DISSOLVED SOLIDS OR SALINITY [mg/L or PPM]: ',
                 0, float(' +inf'))
+            WD = 0.0
             PPN = 0.0
 
         # ISUM
@@ -410,7 +425,7 @@ def get_parameters():
         logging.info(
             '\nDo you want to save entered parameters in an INI file [Y/n]?')
         while True:
-            CHR = raw_input('Please enter choice: ').upper().strip()
+            CHR = input('Please enter choice: ').upper().strip()
             if CHR in ['Y', 'N', '']:
                 break
         if CHR in ['Y', '']:
@@ -478,6 +493,7 @@ def get_parameters():
     param.PPN = PPN
     param.DA = DA
     param.SALT = SALT
+    param.WD = WD
     param.LK = LK
     param.ISUM = ISUM
     param.IT = IT
@@ -485,12 +501,26 @@ def get_parameters():
     param.IV = IV
     param.IP = IP
 
+def read_df(df:pd.DataFrame):
+    """PROCESS INPUT DATA FROM A PANDAS DATAFRAME"""
+    param.NN = len(df)
+    data.df = df
+    data.DATE = [dt.datetime(ind.year, ind.month, 1) for ind in df.index]
+    data.LENGTH = [1] * param.NN
+    data.TD = df['TD'].values
+    data.T = df['T'].values
+    data.S = df['S'].values
+    data.HADD = [0.0] * param.NN # Assumes no HADD data
+    data.TDW = [0.0] * param.NN
+    data.TW = [0.0] * param.NN
+    data.SW = [0.0] * param.NN
+
 
 def read_data_file():
     """PROCESS ALL THE INPUT DATA"""
     logging.info('\nReading DATA file: {}'.format(
         os.path.basename(paths.csv)))
-    dat_f = open(paths.csv, 'rb')
+    dat_f = open(paths.csv, 'r')
     dat_lines = [line.strip() for line in dat_f.readlines()]
     dat_f.close()
     # First line may be SITE name or Fields
@@ -539,10 +569,11 @@ def read_data_file():
     hadd_i = column_index(['HADD'])
 
     # Check date fields
-    if year_i >= 0 and doy_i >= 0 and length_i >= 0:
-        dt_doy_flag = True
-        dt_format = '%Y_%j'
-    elif year_i >= 0 and day_i >= 0 and day_i >= 0 and length_i >= 0:
+    if doy_i is not None:
+        if year_i >= 0 and doy_i >= 0 and length_i >= 0:
+            dt_doy_flag = True
+            dt_format = '%Y_%j'
+    elif year_i >= 0 and day_i >= 0 and length_i >= 0:
         dt_doy_flag = False
         dt_format = '%Y_%m_%d'
     else:
@@ -579,7 +610,7 @@ def read_data_file():
         data.TD[i] = float(dat_line[td_i])
         data.T[i] = float(dat_line[t_i])
         data.S[i] = float(dat_line[s_i])
-        data.HADD[i] = float(dat_line[hadd_i]) if hadd_i >= 0 else 0.0
+        data.HADD[i] = float(dat_line[hadd_i]) if hadd_i is not None and hadd_i >= 0 else 0.0
 
 
 def initialize():
@@ -1132,6 +1163,108 @@ def compute_available_heat():
             param.GLBGN = GLB
     param.GLEND = GLE
 
+def deep_lake_evap():
+    """COMPUTES DEEP LAKE EVAPORATION (ONLY SHOULD BE USED WITH LK >= 2)"""
+    df = pd.DataFrame()
+    df.index = data.df.index
+    df['ETMM'] = data.ETMM # shallow lake evaporation (mm)
+    df['ETPMM'] = data.ETPMM # potential evaporation (mm)
+    # only data between March and October is used (set others to zero)
+    df.loc[(df.index.month < 3) | (df.index.month > 10), ['ETMM', 'ETPMM']] = 0
+    df_sum = df.resample('M').sum()
+    # calculate monthly means
+    df_sum['MONTH'] = df_sum.index.month
+    monthly_df = df_sum.groupby('MONTH').mean()
+    df_sum.drop('MONTH', axis=1, inplace=True)
+    # calculate effective depth, in m (eq. 9 pg. 172)
+    ED = param.DA / (1 + 0.00003 * param.SALT)
+
+    # calculate routing constant k, in months (eq. 7 pg. 172)
+    Kconst = ED * (0.04 + (0.11 / (1 + (ED/16)**2)))
+
+    # calculate delay time t, in months (eq. 8 pg. 172)
+    tconst = 0.5 * Kconst
+
+    # compute the monthly deep lake evaporation for primer year
+    # using monthly means as esimates of shallow lake evaporation
+    # in the primer year. Calculations in primer year start in april.
+    ELBE = np.zeros(12)
+    for KN in range(4,13):
+        IT = round(KN - tconst)
+        ITP = round(KN - tconst - 1)
+        if IT < 1:
+            IT = 12 + IT
+        EWTa = monthly_df['ETMM'][IT]
+        if ITP < 1:
+            ITP = 12 + ITP
+        EWTb = monthly_df['ETMM'][ITP]
+        
+        # intepolating the value for tconst back in time as it will be between
+        # two values (eq. 3 pg. 170)
+        EWT = EWTa + (tconst - int(tconst)) * (EWTb - EWTa)
+        KNN = KN - 1
+        if KN == 4: 
+            ELB = monthly_df['ETMM'][3] # april
+        if KN > 4: 
+            ELB = ELBE[KNN-1]
+        ELE = ELB
+        for _ in range(10):
+            num = EWT - 0.5 * (ELB + ELE) + Kconst * ELB * (1 + 7 * np.exp(-ELB/12)) - Kconst * ELE * (1+7*np.exp(-ELE/12))
+            denom = 0.5 + Kconst + 7 * Kconst * (1 - ELE/12) * np.exp(-ELE/12)
+            DELE = num / denom
+            if abs(DELE) < 0.01:
+                break
+            ELE += DELE
+        ELBE[KN-1] = ELE
+    # compute deep lake evaporation for each period using primer year as a feed
+    # interpolate EWT using tconst - go into mean array if needed at beginning of run
+    # this is interpolating the value at tconst back in time as it will be between two values
+    ELD_list = np.zeros(len(df_sum))
+    for DataRow in range(len(df_sum)):
+        i = df_sum.index[DataRow].month
+        testrow = DataRow - tconst
+        Tmonth = 12 + round(i - tconst)
+
+        if testrow < 0:
+            if Tmonth > 12:
+                EWTa = df_sum['ETMM'].iloc[12]
+            else:
+                EWTa = monthly_df['ETMM'][Tmonth]
+            EWTb = monthly_df['ETMM'][Tmonth - 1]
+        else:
+            EWTa = df_sum['ETMM'].iloc[DataRow - int(tconst)]
+            EWTb = df_sum['ETMM'].iloc[DataRow - int(tconst) - 1]
+        
+        # interpolate the value for tconst back in time as it will be between two values
+        EWT = EWTa + (tconst - int(tconst)) * (EWTb - EWTa)
+        if DataRow == 0:
+            ELB = ELBE[-1]
+        ELE = ELB
+        for _ in range(10):
+            num = EWT - 0.5 * (ELB + ELE) + Kconst * ELB * (1 + 7 * np.exp(-ELB/12)) - Kconst * ELE * (1+7*np.exp(-ELE/12))
+            denom = 0.5 + Kconst + 7 * Kconst * (1 - (ELE / 12)) * np.exp(-ELE / 12)
+            DELE =  num / denom 
+            if abs(DELE) < 0.01:
+                break
+            ELE += DELE
+        ELBF = ELE
+        ELD = 0.5 * (ELB + ELE)
+        if i <= 2 or i >= 11:
+            ELD = 0
+        if ELD < 0:
+            ELD = 0
+        ELD_list[DataRow] = round(ELD)
+        ELB = ELBF
+    
+    df_sum['ELD'] = ELD_list
+    return df_sum
+
+def deep_lake_edge_effects(df: pd.DataFrame):
+    """COMPUTES THE EDGE EFFECTS OF DEEP LAKE EVAPORATION."""
+    # assumes input df is from the output of deep_lake_evap()
+    df['ELDE'] = df['ELD'] + (df['ETPMM'] - df['ELD']) * (np.log(1 + (param.WD / 13))) / (param.WD / 13)
+    df['ELDE'] = df['ELDE'].round()
+    return df
 
 def print_output():
     """"""
@@ -1350,5 +1483,4 @@ def arg_parse():
 if __name__ == '__main__':
     args = arg_parse()
     logging.basicConfig(level=args.loglevel, format='%(message)s')
-
     WREVAP(args.ini, args.data)
